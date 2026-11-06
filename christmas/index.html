@@ -114,10 +114,14 @@ const melody = [
 const CH = { C:{r:48,t:[60,64,67]}, F:{r:53,t:[60,65,69]}, D:{r:50,t:[62,66,69]}, G:{r:43,t:[59,62,67]} };
 const bars = ['C','C','C','C','F','C','D','G','C','C','C','C','F','C','G','C'];
 
+let master;
 function initAudio(){
   if (ac) return;
-  ac = new (window.AudioContext || window.webkitAudioContext)();
-  const master = ac.createGain(); master.gain.value = .9;
+  buildGraph(new (window.AudioContext || window.webkitAudioContext)());
+}
+function buildGraph(ctx){
+  ac = ctx;
+  master = ac.createGain(); master.gain.value = .9;
   const comp = ac.createDynamicsCompressor(); comp.threshold.value = -14; comp.ratio.value = 4;
   master.connect(comp).connect(ac.destination);
   musicGain = ac.createGain(); musicGain.gain.value = 0; musicGain.connect(master);
@@ -198,9 +202,9 @@ function stopMusic(){
 }
 function chime(){
   initAudio(); if (ac.state === 'suspended') ac.resume();
-  const t = ac.currentTime + .01, base = [84, 88, 91, 96];
-  base.forEach((m, i) => bell(mf(m), t + i * .06, .09, sfxGain));
+  chimeAt(ac.currentTime + .01);
 }
+function chimeAt(t){ [84, 88, 91, 96].forEach((m, i) => bell(mf(m), t + i * .06, .09, sfxGain)); }
 const btn = document.getElementById('music'), lbl = document.getElementById('musicLabel');
 btn.addEventListener('click', e => {
   e.stopPropagation();
@@ -547,13 +551,40 @@ function drawParts(dt){
 cv.addEventListener('pointerdown', e => { burst(e.clientX, e.clientY, 70, true); chime(); });
 
 /* loop */
+/* video render mode (#render): virtual clock driven by the recorder, audio rendered offline with the same instruments */
+const RENDER = location.hash === '#render';
+let tOffset = 0;
+if (RENDER){
+  document.querySelector('.dock').style.display = 'none';
+  window.__render = {
+    start(lead){ const base = performance.now()/1000; tOffset = base - 16; loopStart = base + lead; playing = true; document.body.classList.add('playing'); },
+    tap(x, y, big){ burst(x, y, big ? 90 : 70, true); },
+    async audio(sec, lead, taps){
+      const sr = 44100, oc = new OfflineAudioContext(1, Math.ceil(sr*sec), sr);
+      buildGraph(oc); musicGain.gain.value = 1;
+      master.gain.setValueAtTime(.9, sec - 1.4); master.gain.linearRampToValueAtTime(0, sec - .05);
+      for (let t = lead; t < sec; t += LOOP_BEATS*B) scheduleLoop(t);
+      taps.forEach(t => chimeAt(t));
+      const d = (await oc.startRendering()).getChannelData(0);
+      const out = new DataView(new ArrayBuffer(44 + d.length*2)), w = (o, s) => { for (let i=0;i<s.length;i++) out.setUint8(o+i, s.charCodeAt(i)); };
+      w(0,'RIFF'); out.setUint32(4, 36 + d.length*2, true); w(8,'WAVEfmt '); out.setUint32(16,16,true); out.setUint16(20,1,true); out.setUint16(22,1,true);
+      out.setUint32(24,sr,true); out.setUint32(28,sr*2,true); out.setUint16(32,2,true); out.setUint16(34,16,true); w(36,'data'); out.setUint32(40,d.length*2,true);
+      for (let i=0;i<d.length;i++) out.setInt16(44+i*2, Math.max(-1, Math.min(1, d[i]))*32767, true);
+      const bytes = new Uint8Array(out.buffer); let bin = '';
+      for (let i=0;i<bytes.length;i+=32768) bin += String.fromCharCode.apply(null, bytes.subarray(i, i+32768));
+      return btoa(bin);
+    }
+  };
+}
+const clockNow = () => RENDER ? performance.now()/1000 : ac.currentTime;
+
 let last = performance.now(), lastBar = -1;
 function frame(now){
   const dt = Math.min(.05, (now - last)/1000); last = now;
-  const t = now/1000;
+  const t = now/1000 - tOffset;
   let mus = null;
-  if (playing && ac){
-    const e = (ac.currentTime - loopStart)/B;
+  if (playing && (ac || RENDER)){
+    const e = (clockNow() - loopStart)/B;
     if (e >= 0){
       mus = {e, pulse: reduce ? 0 : Math.exp(-(e % 1)*5)};
       const bar = Math.floor(e/4);
